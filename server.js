@@ -4,22 +4,34 @@
 
 import 'dotenv/config';
 import express from 'express';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { createHash, randomUUID } from 'crypto';
-import { readFile, unlink, mkdir, stat } from 'fs/promises';
+import { readFile, unlink, mkdir, stat, appendFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, extname } from 'path';
-import { execFile } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import FormData from 'form-data';
 import fetch from 'node-fetch';
 
+const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
+// ─── Environment validation ───────────────────────────────────────
+const REQUIRED_ENV = ['DETECTIF_API_KEY'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length) {
+  console.error(`\n❌  Missing required environment variable(s): ${missingEnv.join(', ')}`);
+  console.error('    Please set them in your .env file and restart.\n');
+  process.exit(1);
+}
+
 // ─── Config ───────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
+const PORT = 3003;
 const DETECTIF_API_KEY = process.env.DETECTIF_API_KEY;
 const STT_URL = process.env.STT_URL || 'https://api.groq.com/openai/v1/audio/transcriptions';
 const STT_MODEL = process.env.STT_MODEL || 'whisper-large-v3';
@@ -64,6 +76,18 @@ try {
 const app = express();
 await mkdir(TMP_DIR, { recursive: true });
 
+// Security headers
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// Rate limiting: max 20 analysis requests per 15 minutes per IP
+const analysisLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please wait a few minutes and try again.' }
+});
+
 const upload = multer({
   dest: TMP_DIR,
   limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB
@@ -80,6 +104,10 @@ const upload = multer({
 
 app.use(express.json());
 app.use(express.static(join(__dirname, 'public')));
+
+// Apply rate limiter to analysis endpoints
+app.use('/api/analyze', analysisLimiter);
+app.use('/api/check-text', analysisLimiter);
 
 // ─── In-memory Aletheia cache (SHA-256 of WAV → result) ──────────
 const aletheiaCache = new Map();
@@ -246,7 +274,7 @@ async function transcribe(wavPath, lang = 'en') {
   const form = new FormData();
   form.append('file', wavBuffer, { filename: 'clip.wav', contentType: 'audio/wav' });
   form.append('model', STT_MODEL);
-  if (lang) form.append('language', lang);
+  if (lang && lang !== 'auto') form.append('language', lang);
 
   let res;
   try {
@@ -271,53 +299,13 @@ async function transcribe(wavPath, lang = 'en') {
   return { transcript: json.text || json.transcript || '', error: null };
 }
 
-// ─── Pressure-tactic keyword heuristic ───────────────────────────
+// ─── Pressure-tactic keyword heuristic (loaded from dataset) ─────
 // NOTE: This is a simple keyword/phrase heuristic, NOT NLP or ML.
 // It will have false positives and negatives. See README for limitations.
-const PRESSURE_KEYWORDS = {
-  urgency: {
-    en: ['immediately', 'right now', 'hurry', 'urgent', 'quickly', 'fast', 'rush', 'today only', 'last chance', 'now or never', "don't wait", 'act now', 'time is running out', 'expires', 'deadline', 'within 1 hour', 'within one hour', 'need help', 'send help', 'help me', 'save me', 'in trouble', 'emergency', 'abhi', 'jaldi', 'turant'],
-    hi: ['तुरंत', 'अभी', 'जल्दी', 'फौरन', 'अभी के अभी', 'देर मत करो', 'समय निकल रहा है', 'आज ही', 'अभी करो', 'जल्दी करो', 'रुको मत', 'मदद करो', 'बचाओ', 'मुसीबत में'],
-    kn: ['ಈಗಲೇ', 'ತಕ್ಷಣ', 'ಬೇಗ', 'ಬೇಗನೆ', 'ಆತುರ', 'ತಡ ಮಾಡಬೇಡಿ', 'ಹೊತ್ತು ಮೀರುತ್ತಿದೆ', 'ಸಹಾಯ ಮಾಡಿ', 'ಕಾಪಾಡಿ'],
-    es: ['inmediatamente', 'ahora mismo', 'apresúrate', 'urgente', 'rápido', 'pronto', 'hoy sólo', 'última oportunidad', 'ahora o nunca', 'no esperes', 'actúa ahora', 'el tiempo se acaba', 'fecha límite', 'en una hora', 'necesito ayuda', 'ayuda', 'salva me', 'en problemas', 'emergencia'],
-    fr: ['immédiatement', 'tout de suite', 'dépêche-toi', 'urgent', 'rapidement', 'vite', 'aujourd\'hui seulement', 'dernière chance', 'maintenant ou jamais', "n'attends pas", 'agis maintenant', 'le temps presse', 'date limite', 'dans une heure', 'besoin d\'aide', 'aide', 'sauve-moi', 'en difficulté', 'urgence'],
-    zh: ['立刻', '马上', '赶紧', '紧急', '快速', '尽快', '仅今日', '最后机会', '现在或永不', '别等了', '立即行动', '时间不多了', '截止日期', '一小时内', '需要帮助', '帮助', '救命', '陷入困境', '紧急情况']
-  },
-  secrecy: {
-    en: ['don\'t tell', 'do not tell', 'keep it secret', 'between us', 'confidential', 'don\'t share', 'don\'t inform', 'keep quiet', 'secret', 'nobody should know', "don\'t mention", 'just between you and me', 'kisi ko mat batao', 'kisi ko mat batana'],
-    hi: ['किसी को मत बताना', 'किसी को मत बताओ', 'गुप्त', 'छुपाकर', 'बीच में कोई नहीं', 'किसी से मत कहना', 'चुप रहो', 'रहस्य', 'किसी को पता नहीं चलना चाहिए'],
-    kn: ['ಯಾರಿಗೂ ಹೇಳಬೇಡಿ', 'ರಹಸ್ಯ', 'ಗುಟ್ಟು', 'ಯಾರಿಗೂ ತಿಳಿಸಬೇಡಿ', 'ಬಾಯಿ ಮುಚ್ಚಿಕೊಂಡಿರಿ'],
-    es: ['no lo cuentes', 'no lo digas', 'mantenerlo secreto', 'entre nosotros', 'confidencial', 'no compartir', 'no informar', 'mantener silencio'],
-    fr: ['ne le dites pas', 'ne le révélez pas', 'garder secret', 'entre nous', 'confidentiel', 'ne partagez pas', 'ne pas informer', 'garder le silence'],
-    zh: ['不要透露', '不要告诉', '保密', '我们之间', '机密', '不分享', '不通报', '保持沉默']
-  },
-  money: {
-    en: ['send money', 'transfer', 'UPI', 'gift card', 'account number', 'OTP', 'payment', 'rupees', 'bank account', 'wire', 'cash', 'google pay', 'gpay', 'phone pe', 'phonepe', 'paytm', 'neft', 'imps', 'rtgs', 'bitcoin', 'crypto', 'one-time password', 'send 20000', 'send 50000', 'credit card', 'debit card', 'CVV', 'pin number', 'bank details', 'ransom'],
-    hi: ['पैसे भेजो', 'ट्रांसफर', 'UPI', 'गिफ्ट कार्ड', 'अकाउंट नंबर', 'ओटीपी', 'OTP', 'भुगतान', 'रुपये', 'बैंक खाता', 'पेटीएम', 'गूगल पे', 'फोन पे', 'पैसा', 'रकम', 'फिरौती'],
-    kn: ['ಹಣ ಕಳುಹಿಸಿ', 'ವರ್ಗಾವಣೆ', 'ಯುಪಿಐ', 'ಗಿಫ್ಟ್ ಕಾರ್ಡ್', 'ಖಾತೆ ಸಂಖ್ಯೆ', 'ಒಟಿಪಿ', 'ಪಾವತಿ', 'ರೂಪಾಯಿ', 'ಬ್ಯಾಂಕ್ ಖಾತೆ'],
-    es: ['enviar dinero', 'transferir', 'UPI', 'tarjeta de regalo', 'número de cuenta', 'OTP', 'pago', 'rupees', 'cuenta bancaria', 'efectivo', 'Google Pay', 'Paytm', 'transferencia'],
-    fr: ['envoyer de l\'argent', 'transférer', 'UPI', 'carte cadeau', 'numéro de compte', 'OTP', 'paiement', 'rupees', 'compte bancaire', 'espèces', 'Google Pay', 'Paytm'],
-    zh: ['汇款', '转账', 'UPI', '礼品卡', '账号', '一次性密码', '支付', '卢比', '银行账户', '现金', 'Google Pay', 'Paytm']
-  },
-  threat: {
-    en: ['arrest', 'arrested', 'police', 'CBI', 'customs', 'warrant', 'digital arrest', 'case registered', 'FIR', 'court', 'jail', 'prison', 'legal action', 'law enforcement', 'investigation', 'ED', 'enforcement directorate', 'income tax', 'raid', 'narcotics', 'NCB', 'suspend your account', 'block your account', 'seize', 'penalty', 'fine', 'prosecution'],
-    hi: ['गिरफ्तार', 'गिरफ्तारी', 'पुलिस', 'सीबीआई', 'CBI', 'कस्टम', 'वारंट', 'डिजिटल अरेस्ट', 'केस दर्ज', 'FIR', 'कोर्ट', 'जेल', 'कानूनी कार्रवाई', 'जांच', 'ईडी', 'आयकर', 'छापा', 'NCB', 'खाता बंद', 'जब्त', 'जुर्माना'],
-    kn: ['ಬಂಧನ', 'ಪೊಲೀಸ್', 'ಸಿಬಿಐ', 'ಕಸ್ಟಮ್ಸ್', 'ವಾರಂಟ್', 'ಡಿಜಿಟಲ್ ಅರೆಸ್ಟ್', 'ಎಫ್ಐಆರ್', 'ನ್ಯಾಯಾಲಯ', 'ಜೈಲು', 'ಕಾನೂನು ಕ್ರಮ'],
-    es: ['arresto', 'policía', 'orden de captura', 'investigación', 'sanción', 'banco bloqueado', 'incautar', 'multa', 'enjuiciamiento'],
-    fr: ['arrêt', 'police', 'mandat d\'arrêt', 'enquête', 'sanction', 'compte bloqué', 'confiscation', 'amende', 'poursuite'],
-    zh: ['逮捕', '警察', '逮捕令', '调查', '处罚', '账户冻结', '没收', '罚款', '起诉']
-  },
-  distress: {
-    en: ['kidnapped', 'kidnap', 'abducted', 'hostage', 'trapped', 'stuck', "don\'t know where i am", 'accident', 'hospital', 'injured', 'bleeding', 'danger', 'locked up', 'hurt'],
-    hi: ['किडनैप', 'अपहरण', 'फंसा हुआ', 'फंसी हुई', 'एक्सीडेंट', 'अस्पताल', 'चोट', 'खतरा', 'बंद कर दिया'],
-    kn: ['ಅಪಹರಣ', 'ಸಿಲುಕಿಕೊಂಡಿದ್ದೇನೆ', 'ಅಪಘಾತ', 'ಆಸ್ಪತ್ರೆ', 'ಗಾಯ', 'ಅಪಾಯ'],
-    es: ['secuestrado', 'rapto', 'secuestrada', 'encerrado', 'accidente', 'hospital', 'herido', 'sangrado', 'peligro', 'encerrado'],
-    fr: ['enlevé', 'kidnappe', 'enlevée', 'piégé', 'accident', 'hôpital', 'blessé', 'saignement', 'danger', 'enfermé'],
-    zh: ['被绑架', '绑架', '人质', '困住', '事故', '医院', '受伤', '出血', '危险', '被锁住']
-  }
-}
-
-
+const keywordDataset = JSON.parse(
+  await readFile(join(__dirname, 'data', 'scam-keywords.json'), 'utf8')
+);
+const PRESSURE_KEYWORDS = keywordDataset.pressureKeywords;
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -362,38 +350,56 @@ function checkPressure(text) {
 }
 
 // ─── Risk level logic ────────────────────────────────────────────
-// "high" = synthetic voice AND ≥2 pressure categories
-// "warn" = synthetic voice OR ≥2 pressure categories
+// "critical" = ≥3 coercion vectors OR (critical phrase + financial demand) OR (synthetic voice + ≥3 vectors)
+// "high" = synthetic voice AND (≥2 pressure categories OR critical phrase)
+// "warn" = synthetic voice OR ≥2 pressure categories OR critical phrase
+// "safe" = no pressure vectors and not synthetic voice
 // "calm" = otherwise
-// The app NEVER says "safe".
-const CRITICAL_PHRASES = new Set([
-  'kidnapped', 'kidnap', 'abducted', 'hostage', 'ransom', 'digital arrest',
-  'किडनैप', 'अपहरण', 'फिरौती', 'डिजिटल अरेस्ट', 'ಅಪಹರಣ', 'ಡಿಜಿಟಲ್ ಅರೆಸ್ಟ್'
+const CRITICAL_PHRASES = new Set(
+  keywordDataset.criticalPhrases.map(p => p.toLowerCase())
+);
+const FINANCIAL_PHRASES = new Set([
+  'upi', 'bank', 'payment', 'transfer', 'money', 'financial', 'account'
 ]);
 
 function riskLevel(voice, pressure) {
   const isSynthetic = voice.synthetic;
-  const highPressure = pressure.count >= 2;
+  const pressureCount = pressure.count;
   const hasCritical = Object.values(pressure.matches || {})
     .flat()
     .some(p => CRITICAL_PHRASES.has(p.toLowerCase()));
+  const hasFinancial = Object.values(pressure.matches || {})
+    .flat()
+    .some(p => FINANCIAL_PHRASES.has(p.toLowerCase()));
 
-  if (isSynthetic && (highPressure || hasCritical)) return 'high';
-  if (isSynthetic || highPressure || hasCritical) return 'warn';
+  // SAFE: no pressure vectors and not synthetic voice
+  if (!isSynthetic && pressureCount === 0) return 'safe';
+
+  // CRITICAL tier detection
+  if (pressureCount >= 3 || (hasCritical && hasFinancial) || (isSynthetic && pressureCount >= 3)) {
+    return 'critical';
+  }
+
+  // HIGH tier detection
+  if (isSynthetic && (pressureCount >= 2 || hasCritical)) return 'high';
+
+  // WARN tier detection
+  if (isSynthetic || pressureCount >= 2 || hasCritical) return 'warn';
+
+  // CALM as fallback
   return 'calm';
 }
 
 // ─── Guardian Alerts (Telegram + WhatsApp) ──────────────────────
-function buildAlertMessage(level, voice, pressure, transcript) {
+function buildAlertMessage(level, voice, pressure, transcript, safeWord) {
+  const safeWordCheck = `\n🔐 Family Safe-Word Check: Ask caller to confirm code word "${safeWord || 'MANGO-7'}" before taking action.`;
   const categoryList = Object.keys(pressure.categories).join(', ') || 'none';
   const excerpt = transcript
     ? (transcript.length > 300 ? transcript.slice(0, 300) + '…' : transcript)
     : '(no transcript)';
-
   const voiceLine = voice.verdict === 'text-only'
     ? 'Text message check (no audio)'
     : `${voice.verdict}${voice.score !== null ? ` (score: ${voice.score})` : ''}`;
-
   return [
     `🚨 *Hold On – ${level.toUpperCase()} ALERT*`,
     '',
@@ -403,9 +409,10 @@ function buildAlertMessage(level, voice, pressure, transcript) {
     `*Message / Transcript excerpt:*`,
     excerpt,
     '',
-    `⚠️ Please check on your family member. This is an automated alert from Hold On.`
+    `⚠️ Please check on your family member. This is an automated alert from Hold On.${safeWordCheck}`
   ].join('\n');
 }
+
 
 async function sendTelegramAlert(level, alertText, wavPath) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
@@ -451,18 +458,113 @@ async function sendTelegramAlert(level, alertText, wavPath) {
     return { channel: 'Telegram', sent: true, reason: null };
   } catch (err) {
     console.error('[Telegram] Alert error:', err.message);
-    return { channel: 'Telegram', sent: false, reason: err.message };
+    return { channel: 'Telegram', sent: false, reason: err.message, networkError: isNetworkError(err) };
+  }
+}
+
+function isNetworkError(err) {
+  const msg = String(err?.message || err || '');
+  const code = String(err?.code || err?.cause?.code || '');
+  return (
+    ['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(code) ||
+    /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ECONNRESET|EAI_AGAIN|fetch failed|unreachable|network/i.test(msg)
+  );
+}
+
+// ─── Offline Retry Queue (WhatsApp & Telegram) ───────────────────
+const alertRetryQueue = [];
+
+const ADB_CANDIDATES = [
+  process.env.ADB_PATH,
+  'adb',
+  process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Android', 'Sdk', 'platform-tools', 'adb.exe') : null,
+  'C:\\platform-tools\\adb.exe'
+].filter(Boolean);
+
+let RESOLVED_ADB = 'adb';
+for (const candidate of ADB_CANDIDATES) {
+  if (candidate === 'adb' || existsSync(candidate)) {
+    try {
+      await execAsync(`"${candidate}" version`, { timeout: 2000 });
+      RESOLVED_ADB = candidate;
+      break;
+    } catch { /* try next */ }
+  }
+}
+
+function formatSmsPhone(raw) {
+  if (!raw) return null;
+  let cleaned = String(raw).replace(/@c\.us$/i, '').replace(/@s\.whatsapp\.net$/i, '').replace(/[\s\-()]/g, '');
+  if (!cleaned) return null;
+  if (!cleaned.startsWith('+')) {
+    if (/^\d{10}$/.test(cleaned)) cleaned = '+91' + cleaned;
+    else cleaned = '+' + cleaned;
+  }
+  return /^\+\d{7,15}$/.test(cleaned) ? cleaned : null;
+}
+
+async function checkAdbDevice() {
+  try {
+    const { stdout } = await execAsync(`"${RESOLVED_ADB}" devices`, { timeout: 3000 });
+    const lines = stdout.split(/\r?\n/).slice(1);
+    return lines.some(line => /\bdevice\b/.test(line.trim()));
+  } catch {
+    return false;
+  }
+}
+
+async function sendSmsAlert(message) {
+  const phone = formatSmsPhone(process.env.WA_TO || WA_TO);
+  if (!phone) {
+    console.warn('[SMS] Cannot send SMS: WA_TO is missing or invalid.');
+    return { channel: 'SMS', sent: false, reason: 'WA_TO not configured' };
+  }
+
+  const hasDevice = await checkAdbDevice();
+  if (!hasDevice) {
+    console.warn('[SMS] No Android device detected via adb devices – skipping ADB SMS.');
+    return { channel: 'SMS', sent: false, reason: 'Offline Cellular Standby Ready' };
+  }
+
+  try {
+    // Strip markdown asterisks and collapse newlines/spaces for clean SMS parcel string
+    const cleanBody = String(message)
+      .replace(/\*/g, '')
+      .replace(/\r?\n+/g, ' | ')
+      .slice(0, 320);
+
+    // Escape quotes, backslashes, and shell metacharacters for adb shell service call isms (Android 11-15+)
+    const escapedBody = cleanBody
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\$/g, '\\$')
+      .replace(/`/g, '\\`');
+
+    const cmd = `"${RESOLVED_ADB}" shell service call isms 5 i32 0 s16 "com.android.shell" s16 "null" s16 "${phone}" s16 "null" s16 "${escapedBody}" s16 "null" s16 "null" i32 0 i64 0`;
+    const { stdout, stderr } = await execAsync(cmd, { timeout: 10_000 });
+
+    if (stderr && /error|exception|not found/i.test(stderr)) {
+      console.error('[SMS] ADB SMS failed:', stderr.trim());
+      return { channel: 'SMS', sent: false, reason: stderr.trim() };
+    }
+
+    console.log(`[SMS] ADB SMS sent to ${phone}:`, stdout.trim() || 'OK');
+    return { channel: 'SMS', sent: true, reason: null };
+  } catch (err) {
+    console.error('[SMS] ADB SMS error:', err.message);
+    return { channel: 'SMS', sent: false, reason: err.message };
   }
 }
 
 async function sendWhatsAppText(to, body) {
   // GREEN-API sendMessage endpoint
+  const chatTarget = String(to || WA_TO).replace(/@c\.us$/i, '');
   const endpoint = `${GREEN_API_URL}/waInstance${GREEN_API_ID_INSTANCE}/sendMessage/${GREEN_API_TOKEN}`;
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      chatId: `${WA_TO}@c.us`,
+      chatId: `${chatTarget}@c.us`,
       message: body
     })
   });
@@ -470,27 +572,23 @@ async function sendWhatsAppText(to, body) {
     const errText = await res.text().catch(() => '');
     throw new Error(`GREEN-API HTTP ${res.status}: ${errText.slice(0, 150)}`);
   }
+  return res.json().catch(() => ({}));
 }
-// Legacy Meta API block removed
 
 async function sendWhatsAppAlert(level, alertText, wavPath) {
-  // Ensure GREEN-API configuration is present
   if (!GREEN_API_URL || !GREEN_API_ID_INSTANCE || !GREEN_API_TOKEN || !WA_TO) {
     return { channel: 'WhatsApp', sent: false, reason: 'not configured' };
   }
 
   try {
-    // Send text alert via GREEN-API
-    await sendWhatsAppText(WA_TO, alertText);
+    const data = await sendWhatsAppText(WA_TO, alertText);
 
-    // If an audio file is provided, upload via GREEN-API sendFileByUpload endpoint
     if (wavPath && existsSync(wavPath)) {
       const audioBuffer = await readFile(wavPath);
       const form = new FormData();
-      form.append('chatId', `${WA_TO}@c.us`);
+      const chatTarget = String(WA_TO).replace(/@c\.us$/i, '');
+      form.append('chatId', `${chatTarget}@c.us`);
       form.append('file', audioBuffer, { filename: 'suspicious_clip.wav', contentType: 'audio/wav' });
-      // Optional caption can be added if needed
-      // form.append('caption', `Hold On alert – ${level} risk`);
 
       const uploadEndpoint = `${GREEN_API_URL}/waInstance${GREEN_API_ID_INSTANCE}/sendFileByUpload/${GREEN_API_TOKEN}`;
       const res = await fetch(uploadEndpoint, {
@@ -503,76 +601,69 @@ async function sendWhatsAppAlert(level, alertText, wavPath) {
         console.error('[WhatsApp] Audio upload failed:', res.status, errText);
       }
     }
-    return { channel: 'WhatsApp', sent: true, reason: null };
+    return { channel: 'WhatsApp', sent: true, reason: null, idMessage: data?.idMessage || null };
   } catch (err) {
     console.error('[WhatsApp] Alert error:', err.message);
-    return { channel: 'WhatsApp', sent: false, reason: err.message };
-  }
-
-  if (!GREEN_API_URL || !GREEN_API_ID_INSTANCE || !GREEN_API_TOKEN || !WA_TO) {
-    return { channel: 'WhatsApp', sent: false, reason: 'not configured' };
-  }
-
-  try {
-    await sendWhatsAppText(WA_TO, alertText);
-
-    if (wavPath && existsSync(wavPath)) {
-      const audioBuffer = await readFile(wavPath);
-      const form = new FormData();
-      form.append('messaging_product', 'whatsapp');
-      form.append('file', audioBuffer, { filename: 'suspicious_clip.wav', contentType: 'audio/wav' });
-      const mediaRes = await fetch(`https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/media`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${WA_TOKEN}`, ...form.getHeaders() },
-        body: form
-      });
-      if (mediaRes.ok) {
-        const mediaJson = await mediaRes.json();
-        if (mediaJson?.id) {
-          await fetch(`https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/messages`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              messaging_product: 'whatsapp',
-              to: WA_TO,
-              type: 'document',
-              document: { id: mediaJson.id, filename: 'suspicious_clip.wav', caption: `Hold On alert – ${level} risk` }
-            })
-          });
-        }
-      }
-    }
-
-    return { channel: 'WhatsApp', sent: true, reason: null };
-  } catch (err) {
-    console.error('[WhatsApp] Alert error:', err.message);
-    return { channel: 'WhatsApp', sent: false, reason: err.message };
+    return { channel: 'WhatsApp', sent: false, reason: err.message, networkError: isNetworkError(err) };
   }
 }
 
-async function sendGuardianAlert(level, voice, pressure, transcript, wavPath) {
+async function sendGuardianAlert(level, voice, pressure, transcript, wavPath, safeWord) {
   if (level === 'calm') {
     return { sent: false, reason: 'Level is calm – no alert needed' };
   }
 
-  if ((!TG_TOKEN || !TG_CHAT_ID) && (!WA_TOKEN || !WA_PHONE_NUMBER_ID || !WA_TO)) {
-    return { sent: false, reason: 'No guardian channel configured (set TG_TOKEN/TG_CHAT_ID or WA_TOKEN/WA_PHONE_NUMBER_ID/WA_TO)' };
-  }
-
-  const alertText = buildAlertMessage(level, voice, pressure, transcript);
-  const results = await Promise.all([
+  const alertText = buildAlertMessage(level, voice, pressure, transcript, safeWord);
+  const [tgResult, waResult, smsResult] = await Promise.all([
     sendTelegramAlert(level, alertText, wavPath),
-    sendWhatsAppAlert(level, alertText, wavPath)
+    sendWhatsAppAlert(level, alertText, wavPath),
+    sendSmsAlert(alertText)
   ]);
 
+  // Queue failed WhatsApp or Telegram alerts when offline
+  let queuedCount = 0;
+  if (!waResult.sent && waResult.networkError) {
+    alertRetryQueue.push({
+      id: randomUUID(),
+      channel: 'whatsapp',
+      level,
+      alertText,
+      queuedAt: new Date().toISOString()
+    });
+    queuedCount++;
+    console.log(`[RetryQueue] Queued WhatsApp alert (queue size: ${alertRetryQueue.length})`);
+  }
+  if (!tgResult.sent && tgResult.networkError) {
+    alertRetryQueue.push({
+      id: randomUUID(),
+      channel: 'telegram',
+      level,
+      alertText,
+      queuedAt: new Date().toISOString()
+    });
+    queuedCount++;
+    console.log(`[RetryQueue] Queued Telegram alert (queue size: ${alertRetryQueue.length})`);
+  }
+
+  const results = [tgResult, waResult, smsResult];
   const sentChannels = results.filter(r => r.sent).map(r => r.channel);
-  const failed = results.filter(r => !r.sent && r.reason !== 'not configured');
+  const failed = results.filter(r => !r.sent && r.reason !== 'not configured' && r.reason !== 'Offline Cellular Standby Ready');
+  const standby = results.filter(r => r.reason === 'Offline Cellular Standby Ready');
 
   if (sentChannels.length > 0) {
+    const queueNote = queuedCount > 0 ? `; ${queuedCount} queued for online retry` : '';
+    const standbyNote = standby.length > 0 ? ' (SMS: Offline Cellular Standby Ready)' : '';
     const note = failed.length > 0
-      ? `Sent via ${sentChannels.join(' & ')} (${failed.map(f => `${f.channel}: ${f.reason}`).join('; ')})`
-      : `Sent via ${sentChannels.join(' & ')}`;
+      ? `Sent via ${sentChannels.join(' & ')} (${failed.map(f => `${f.channel}: ${f.reason}`).join('; ')}${queueNote})${standbyNote}`
+      : `Sent via ${sentChannels.join(' & ')}${queueNote}${standbyNote}`;
     return { sent: true, reason: note };
+  }
+
+  if (queuedCount > 0) {
+    return {
+      sent: false,
+      reason: `Offline – ${queuedCount} alert(s) queued for retry (${failed.map(f => `${f.channel}: ${f.reason}`).join('; ')})`
+    };
   }
 
   return {
@@ -581,11 +672,57 @@ async function sendGuardianAlert(level, voice, pressure, transcript, wavPath) {
   };
 }
 
+// Background retry loop every 10 seconds to flush alertRetryQueue once online
+setInterval(async () => {
+  if (alertRetryQueue.length === 0) return;
+
+  for (let i = alertRetryQueue.length - 1; i >= 0; i--) {
+    const item = alertRetryQueue[i];
+    try {
+      if (item.channel === 'whatsapp') {
+        const res = await sendWhatsAppText(WA_TO, item.alertText);
+        if (res && res.idMessage) {
+          console.log(`[RetryQueue] Flushed WhatsApp alert ${item.id} (idMessage: ${res.idMessage})`);
+          alertRetryQueue.splice(i, 1);
+        }
+      } else if (item.channel === 'telegram') {
+        const tgRes = await sendTelegramAlert(item.level, item.alertText, null);
+        if (tgRes.sent) {
+          console.log(`[RetryQueue] Flushed Telegram alert ${item.id}`);
+          alertRetryQueue.splice(i, 1);
+        }
+      }
+    } catch (err) {
+      if (!isNetworkError(err)) {
+        console.error(`[RetryQueue] Permanent error for ${item.channel} ${item.id}:`, err.message);
+      }
+    }
+  }
+}, 10_000);
+
 // ─── Cleanup helper ──────────────────────────────────────────────
 async function cleanup(...paths) {
   for (const p of paths) {
     try { if (p) await unlink(p); } catch { /* already gone */ }
   }
+}
+
+// ─── Local rule-based offline scam detector ──────────────────────
+const OFFLINE_RED_FLAGS = [
+  'otp', 'upi', 'pin', 'blocked', 'suspended', 'fraud department',
+  'kyc', 'bank', 'urgent', 'immediately', 'transfer', 'police', 'arrest'
+];
+
+function detectLocalScam(text) {
+  if (!text) return { isScam: false, matchedFlags: [], pressure: { categories: {}, count: 0, matches: {} } };
+  const lower = text.toLowerCase();
+  const matchedFlags = OFFLINE_RED_FLAGS.filter(flag => {
+    const pattern = new RegExp(`\\b${escapeRegex(flag)}\\b`, 'i');
+    return pattern.test(text) || lower.includes(flag);
+  });
+  const pressure = checkPressure(text);
+  const isScam = matchedFlags.length >= 2 || pressure.count >= 2;
+  return { isScam, matchedFlags, pressure };
 }
 
 // ─── Main analysis endpoint ──────────────────────────────────────
@@ -599,6 +736,7 @@ app.post('/api/analyze', upload.single('audio'), async (req, res) => {
     }
 
     const lang = req.body?.lang || 'en';
+    const fallbackText = (req.body?.text || req.body?.transcript || '').trim();
 
     // 1. Convert to WAV
     wavPath = await convertToWav(uploadedPath);
@@ -617,29 +755,105 @@ app.post('/api/analyze', upload.single('audio'), async (req, res) => {
       });
     }
 
-    // 3. Run Aletheia + STT in parallel
-    const [voice, sttResult] = await Promise.all([
-      callAletheia(wavPath),
-      transcribe(wavPath, lang)
-    ]);
+    // 3. Run Aletheia + STT in parallel with offline network fallback
+    let voice;
+    let transcript = null;
+    let sttError = null;
+    let offlineMode = false;
+    let isScam = false;
+    let pressure;
+    let level;
 
-    const transcript = sttResult.transcript;
-    const sttError = sttResult.error;
+    try {
+      const [aletheiaRes, sttResult] = await Promise.all([
+        callAletheia(wavPath),
+        transcribe(wavPath, lang)
+      ]);
+      voice = aletheiaRes;
+      transcript = sttResult.transcript;
+      sttError = sttResult.error;
 
-    // 4. Pressure check on transcript
-    const pressure = checkPressure(transcript || '');
+      if (sttError && isNetworkError(sttError)) {
+        offlineMode = true;
+      }
 
-    // 5. Determine risk level
-    const level = riskLevel(voice, pressure);
+      pressure = checkPressure(transcript || fallbackText || '');
+      const localCheck = detectLocalScam(transcript || fallbackText || '');
+      level = riskLevel(voice, pressure);
+      isScam = level !== 'calm' || localCheck.isScam;
+    } catch (cloudErr) {
+      if (!isNetworkError(cloudErr)) {
+        throw cloudErr;
+      }
+      console.warn('[Analyze] Cloud API unreachable (offline):', cloudErr.message);
+      offlineMode = true;
 
-    // 6. Guardian alert (non-blocking – errors don't break the response)
-    const alert = await sendGuardianAlert(level, voice, pressure, transcript, wavPath).catch(err => ({
+      const availableText = fallbackText || '';
+      const localCheck = detectLocalScam(availableText);
+      pressure = localCheck.pressure;
+      if (localCheck.matchedFlags.length > 0 && !pressure.categories.offline_flags) {
+        pressure.matches.offline_flags = localCheck.matchedFlags;
+      }
+      isScam = localCheck.isScam;
+      level = isScam ? 'high' : 'calm';
+      transcript = availableText || null;
+      sttError = 'Offline mode: cloud speech-to-text unavailable.';
+      voice = {
+        verdict: 'unverified',
+        score: null,
+        synthetic: false,
+        warning: 'Offline mode: cloud deepfake voice check unavailable. Using local rule-based scam detector.'
+      };
+    }
+
+    // 4. Guardian alert (skip if safe)
+    if (level === 'safe') {
+      // Immediate safe response, no alerts sent
+      return res.json({
+        level,
+        isScam: false,
+        offlineMode,
+        checkedAt: new Date().toISOString(),
+        voice: {
+          verdict: voice.verdict,
+          score: voice.score,
+          synthetic: voice.synthetic,
+          warning: voice.warning || null
+        },
+        pressure: {
+          count: pressure.count,
+          categories: pressure.categories,
+          matches: pressure.matches
+        },
+        transcript: transcript || null,
+        sttError: sttError || null,
+        alert: { sent: false, reason: null },
+        disclaimer: 'These results are evidence, not proof.',
+        risk: 'safe',
+        score: 5,
+        status: 'SAFE / VERIFIED'
+      });
+    }
+    const safeWord = req.body?.safeWord || 'MANGO-7';
+    const alert = await sendGuardianAlert(level, voice, pressure, transcript, wavPath, safeWord).catch(err => ({
       sent: false, reason: `Alert error: ${err.message}`
     }));
 
-    // 7. Respond
+    // 5. Log result to results.md
+    const logEntry = [
+      `## ${new Date().toLocaleString()} — ${level.toUpperCase()}${offlineMode ? ' (OFFLINE)' : ''}`,
+      `- **Voice:** ${voice.verdict}${voice.score !== null ? ` (score: ${voice.score})` : ''}`,
+      `- **Pressure:** ${Object.keys(pressure.categories).join(', ') || 'none'}`,
+      `- **Transcript:** ${transcript ? transcript.slice(0, 200) : 'unavailable'}`,
+      ''
+    ].join('\n');
+    appendFile(join(__dirname, 'results.md'), logEntry).catch(() => {});
+
+    // 6. Respond
     res.json({
       level,
+      isScam,
+      offlineMode,
       checkedAt: new Date().toISOString(),
       voice: {
         verdict: voice.verdict,
@@ -686,15 +900,32 @@ app.post('/api/check-text', async (req, res) => {
       synthetic: false,
       warning: 'Text message check (no audio).'
     };
-    const pressure = checkPressure(text);
-    const level = riskLevel(voice, pressure);
+    const localCheck = detectLocalScam(text);
+    const pressure = localCheck.pressure;
+    let level = riskLevel(voice, pressure);
+      if (level === 'safe') {
+        // Immediate safe response, no alerts sent
+        return res.json({
+          risk: 'safe',
+          score: 5,
+          status: 'SAFE / VERIFIED',
+          headline: 'No Scam Indicators Detected'
+        });
+      }
+    if (localCheck.isScam && level === 'calm') {
+      level = 'warn';
+    }
+    const isScam = level !== 'calm' || localCheck.isScam;
 
-    const alert = await sendGuardianAlert(level, voice, pressure, text, null).catch(err => ({
+    const safeWord = req.body?.safeWord || 'MANGO-7';
+      const alert = await sendGuardianAlert(level, voice, pressure, text, safeWord).catch(err => ({
       sent: false, reason: `Alert error: ${err.message}`
     }));
 
     res.json({
       level,
+      isScam,
+      offlineMode: false,
       checkedAt: new Date().toISOString(),
       voice,
       pressure: {
@@ -761,31 +992,55 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
 });
 
 // ─── Health check ────────────────────────────────────────────────
-app.get('/api/health', (_, res) => {
+app.get('/api/health', async (_, res) => {
+  const adbConnected = await checkAdbDevice();
+  const smsConfigured = !!formatSmsPhone(process.env.WA_TO || WA_TO);
   res.json({
     status: 'ok',
     aletheia: !!DETECTIF_API_KEY,
     stt: !!STT_KEY,
     telegram: !!(TG_TOKEN && TG_CHAT_ID),
-    whatsapp: !!(GREEN_API_URL && GREEN_API_ID_INSTANCE && GREEN_API_TOKEN && WA_TO)
+    whatsapp: !!(GREEN_API_URL && GREEN_API_ID_INSTANCE && GREEN_API_TOKEN && WA_TO),
+    sms: adbConnected || smsConfigured,
+    adbConnected,
+    queuedAlerts: alertRetryQueue.length
   });
 });
 
 // ─── Start ───────────────────────────────────────────────────────
-app.listen(PORT, () => {
+const startupAdbConnected = await checkAdbDevice();
+const startupSmsReady = startupAdbConnected || !!formatSmsPhone(process.env.WA_TO || WA_TO);
+
+const server = app.listen(PORT, () => {
   console.log(`\n🛡️  Hold On is running at http://localhost:${PORT}\n`);
   console.log(`   Aletheia API key: ${DETECTIF_API_KEY ? '✓ set' : '✗ MISSING'}`);
   console.log(`   STT key:         ${STT_KEY ? '✓ set' : '✗ missing (transcript disabled)'}`);
   console.log(`   Telegram:        ${TG_TOKEN && TG_CHAT_ID ? '✓ set' : '✗ missing (alerts disabled)'}`);
   console.log(`   WhatsApp:        ${GREEN_API_URL && GREEN_API_ID_INSTANCE && GREEN_API_TOKEN && WA_TO ? '✓ set' : '✗ missing (alerts disabled)'}`);
+  console.log(`   SMS (ADB):       ${startupAdbConnected ? '✓ Android device connected' : (startupSmsReady ? '✓ enabled (no ADB phone plugged in)' : '✗ missing WA_TO')}`);
   console.log(`   ffmpeg:          ${FFMPEG_PATH}\n`);
 });
+
+// ─── Graceful shutdown ───────────────────────────────────────────
+function shutdown(signal) {
+  console.log(`\n[Hold On] Received ${signal}. Shutting down gracefully…`);
+  server.close(() => {
+    console.log('[Hold On] Server closed. Goodbye!');
+    process.exit(0);
+  });
+  setTimeout(() => { console.error('[Hold On] Force exit after timeout.'); process.exit(1); }, 10_000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 // Log health info on startup
 const healthInfo = {
   status: 'ok',
   aletheia: !!DETECTIF_API_KEY,
   stt: !!STT_KEY,
   telegram: !!(TG_TOKEN && TG_CHAT_ID),
-  whatsapp: !!(GREEN_API_URL && GREEN_API_ID_INSTANCE && GREEN_API_TOKEN && WA_TO)
+  whatsapp: !!(GREEN_API_URL && GREEN_API_ID_INSTANCE && GREEN_API_TOKEN && WA_TO),
+  sms: startupSmsReady,
+  adbConnected: startupAdbConnected,
+  queuedAlerts: alertRetryQueue.length
 };
 console.log('Health check:', JSON.stringify(healthInfo));
